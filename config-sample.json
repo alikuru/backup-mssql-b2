@@ -1,0 +1,33 @@
+{
+  "SQLServer": {
+    "ServerInstance": "localhost",
+    "UseIntegratedSecurity": true,
+    "Username": "",
+    "Password": "",
+    "Databases": []
+  },
+  "BackupPath": "C:\\SQLBackups",
+  "RetentionDays": 7,
+  "Compression": {
+    "Path": "C:\\Program Files\\7-Zip\\7z.exe",
+    "Level": 5
+  },
+  "BackblazeB2": {
+    "Enabled": true,
+    "KeyId": "",
+    "ApplicationKey": "",
+    "BucketName": "",
+    "FolderPath": "SQLBackups",
+    "CliPath": "C:\\Program Files\\Backblaze\\b2.exe"
+  },
+  "Email": {
+    "Enabled": true,
+    "SmtpServer": "",
+    "Port": 587,
+    "EnableSsl": true,
+    "Username": "",
+    "Password": "",
+    "From": "",
+    "To": ""
+  }
+}

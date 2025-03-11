@@ -1,0 +1,9 @@
+.DS_Store
+/**/.vscode/
+*.xproj
+*.xproj.user
+*.suo
+*.csproj.user
+Backup-SQLServer_*.log
+config.json
+ScheduledTask.xml
