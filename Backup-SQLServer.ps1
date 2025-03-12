@@ -174,6 +174,10 @@ function Backup-Databases {
             
             # Backup each database
             $backupFiles = @()
+            $databaseDetails = @()
+            $successCount = 0
+            $failureCount = 0
+            $failedDatabases = @()
             
             foreach ($database in $databasesToBackup) {
                 $dbName = $database.Name
@@ -181,25 +185,63 @@ function Backup-Databases {
                 
                 Write-Log "Starting backup of database: $dbName"
                 
-                $backup = New-Object Microsoft.SqlServer.Management.Smo.Backup
-                $backup.Action = [Microsoft.SqlServer.Management.Smo.BackupActionType]::Database
-                $backup.BackupSetDescription = "Full backup of $dbName"
-                $backup.BackupSetName = "$dbName backup"
-                $backup.Database = $dbName
-                $backup.MediaDescription = "Disk"
-                $backup.Devices.AddDevice($backupFile, [Microsoft.SqlServer.Management.Smo.DeviceType]::File)
-                $backup.Initialize = $true
-                
-                # Execute the backup
-                $backup.SqlBackup($server)
-                
-                Write-Log "Completed backup of database: $dbName to $backupFile"
-                $backupFiles += $backupFile
+                try {
+                    $backup = New-Object Microsoft.SqlServer.Management.Smo.Backup
+                    $backup.Action = [Microsoft.SqlServer.Management.Smo.BackupActionType]::Database
+                    $backup.BackupSetDescription = "Full backup of $dbName"
+                    $backup.BackupSetName = "$dbName backup"
+                    $backup.Database = $dbName
+                    $backup.MediaDescription = "Disk"
+                    $backup.Devices.AddDevice($backupFile, [Microsoft.SqlServer.Management.Smo.DeviceType]::File)
+                    $backup.Initialize = $true
+                    
+                    # Execute the backup
+                    $startTime = Get-Date
+                    $backup.SqlBackup($server)
+                    $endTime = Get-Date
+                    $duration = $endTime - $startTime
+                    
+                    # Get file size
+                    $fileInfo = Get-Item $backupFile
+                    $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+                    
+                    $databaseDetails += @{
+                        Name = $dbName
+                        Status = "Success"
+                        FilePath = $backupFile
+                        SizeMB = $fileSizeMB
+                        Duration = $duration
+                        StartTime = $startTime
+                        EndTime = $endTime
+                    }
+                    
+                    Write-Log "Completed backup of database: $dbName to $backupFile"
+                    $backupFiles += $backupFile
+                    $successCount++
+                }
+                catch {
+                    $errorMsg = $_
+                    Write-Log "Failed to backup database $dbName: $errorMsg" -Level "ERROR"
+                    
+                    $databaseDetails += @{
+                        Name = $dbName
+                        Status = "Failed"
+                        Error = $errorMsg.ToString()
+                    }
+                    
+                    $failureCount++
+                    $failedDatabases += $dbName
+                }
             }
             
             return @{
                 "BackupFolder" = $backupFolder
                 "BackupFiles" = $backupFiles
+                "DatabaseDetails" = $databaseDetails
+                "TotalDatabases" = $databasesToBackup.Count
+                "SuccessCount" = $successCount
+                "FailureCount" = $failureCount
+                "FailedDatabases" = $failedDatabases
             }
         }
         catch {
@@ -332,10 +374,7 @@ function Remove-OldLogs {
 function Sync-ToBackblaze {
     param (
         [Parameter(Mandatory=$true)]
-        [PSCustomObject]$Config,
-        
-        [Parameter(Mandatory=$true)]
-        [string]$CompressedFile
+        [PSCustomObject]$Config
     )
     
     try {
@@ -352,7 +391,7 @@ function Sync-ToBackblaze {
             throw "Backblaze B2 configuration is incomplete. KeyId, ApplicationKey, and BucketName are required."
         }
         
-        Write-Log "Starting Backblaze B2 sync for: $CompressedFile"
+        Write-Log "Starting Backblaze B2 sync for backup directory"
         
         # Set B2 credentials as environment variables
         $env:B2_APPLICATION_KEY_ID = $b2Config.KeyId
@@ -372,18 +411,23 @@ function Sync-ToBackblaze {
             throw "B2 authorization failed with exit code: $($process.ExitCode)"
         }
         
-        # Upload file
-        $fileName = Split-Path -Path $CompressedFile -Leaf
-        $destinationPath = if ($b2Config.FolderPath) { "$($b2Config.FolderPath)/$fileName" } else { $fileName }
-        
-        $uploadArgs = "upload-file --noProgress $($b2Config.BucketName) `"$CompressedFile`" `"$destinationPath`""
-        $process = Start-Process -FilePath $b2CliPath -ArgumentList $uploadArgs -NoNewWindow -PassThru -Wait
-        
-        if ($process.ExitCode -ne 0) {
-            throw "B2 upload failed with exit code: $($process.ExitCode)"
+        # Determine source and destination paths
+        $sourcePath = $Config.BackupPath
+        $destinationPath = "b2://$($b2Config.BucketName)"
+        if (-not [string]::IsNullOrEmpty($b2Config.FolderPath)) {
+            $destinationPath += "/$($b2Config.FolderPath)"
         }
         
-        Write-Log "Successfully uploaded backup to Backblaze B2: $destinationPath"
+        # Sync the backup directory to B2 with delete flag to remove files that don't exist locally
+        Write-Log "Syncing backup directory to Backblaze B2: $sourcePath -> $destinationPath"
+        $syncArgs = "sync --delete --noProgress `"$sourcePath`" `"$destinationPath`""
+        $process = Start-Process -FilePath $b2CliPath -ArgumentList $syncArgs -NoNewWindow -PassThru -Wait
+        
+        if ($process.ExitCode -ne 0) {
+            throw "B2 sync failed with exit code: $($process.ExitCode)"
+        }
+        
+        Write-Log "Successfully synchronized backup directory to Backblaze B2"
         
         # Clear environment variables
         $env:B2_APPLICATION_KEY_ID = $null
@@ -428,10 +472,18 @@ function Send-EmailNotification {
         
         # Build email subject
         $subject = if ($Success) {
-            "SQL Server Backup Successful - $(Get-Date -Format 'yyyy-MM-dd')"
+            if ($BackupInfo.ContainsKey("SuccessCount") -and $BackupInfo.ContainsKey("TotalDatabases")) {
+                "SQL Backup Success: $($BackupInfo.SuccessCount)/$($BackupInfo.TotalDatabases) DBs on $($Config.SQLServer.ServerInstance) - $(Get-Date -Format 'yyyy-MM-dd')"
+            } else {
+                "SQL Server Backup Successful - $($Config.SQLServer.ServerInstance) - $(Get-Date -Format 'yyyy-MM-dd')"
+            }
         }
         else {
-            "SQL Server Backup FAILED - $(Get-Date -Format 'yyyy-MM-dd')"
+            if ($BackupInfo.ContainsKey("FailureCount") -and $BackupInfo.ContainsKey("TotalDatabases")) {
+                "SQL Backup FAILED: $($BackupInfo.FailureCount)/$($BackupInfo.TotalDatabases) DBs failed on $($Config.SQLServer.ServerInstance) - $(Get-Date -Format 'yyyy-MM-dd')"
+            } else {
+                "SQL Server Backup FAILED - $($Config.SQLServer.ServerInstance) - $(Get-Date -Format 'yyyy-MM-dd')"
+            }
         }
         
         # Build email body
@@ -441,10 +493,13 @@ function Send-EmailNotification {
     <style>
         body { font-family: Arial, sans-serif; }
         .success { color: green; }
+        .warning { color: orange; }
         .failure { color: red; }
-        table { border-collapse: collapse; width: 100%; }
+        table { border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 20px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background-color: #f2f2f2; }
+        .success-row { background-color: #f0fff0; }
+        .failure-row { background-color: #fff0f0; }
     </style>
 </head>
 <body>
@@ -453,27 +508,81 @@ function Send-EmailNotification {
     <p>Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
     
     <h3 class="$(if($Success){'success'}else{'failure'})">
-        Status: $(if($Success){'SUCCESS'}else{'FAILURE'})
+        Overall Status: $(if($Success){'SUCCESS'}else{'FAILURE'})
     </h3>
 "@
         
+        if ($BackupInfo.ContainsKey("DatabaseDetails") -and $BackupInfo.DatabaseDetails.Count -gt 0) {
+            $body += @"
+    <h4>Database Backup Details:</h4>
+    <table>
+        <tr>
+            <th>Database</th>
+            <th>Status</th>
+            <th>Size</th>
+            <th>Duration</th>
+        </tr>
+"@
+            
+            foreach ($db in $BackupInfo.DatabaseDetails) {
+                $rowClass = if ($db.Status -eq "Success") { "success-row" } else { "failure-row" }
+                $statusClass = if ($db.Status -eq "Success") { "success" } else { "failure" }
+                $sizeInfo = if ($db.Status -eq "Success") { "$($db.SizeMB) MB" } else { "N/A" }
+                $durationInfo = if ($db.Status -eq "Success") { "$([math]::Round($db.Duration.TotalSeconds, 2)) seconds" } else { "N/A" }
+                
+                $body += @"
+        <tr class="$rowClass">
+            <td>$($db.Name)</td>
+            <td class="$statusClass">$($db.Status)</td>
+            <td>$sizeInfo</td>
+            <td>$durationInfo</td>
+        </tr>
+"@
+            }
+            
+            $body += @"
+    </table>
+    
+    <p>
+        <strong>Summary:</strong> 
+        Total Databases: $($BackupInfo.TotalDatabases), 
+        Successful: <span class="success">$($BackupInfo.SuccessCount)</span>, 
+        Failed: <span class="failure">$($BackupInfo.FailureCount)</span>
+    </p>
+"@
+        }
+        
         if ($Success) {
             $body += @"
-    <h4>Backup Details:</h4>
+    <h4>Backup File Details:</h4>
     <ul>
         <li>Backup Location: $($BackupInfo.CompressedFile)</li>
         <li>Backup Size: $([math]::Round((Get-Item $BackupInfo.CompressedFile).Length / 1MB, 2)) MB</li>
-        <li>Databases Backed Up: $($BackupInfo.DatabaseCount)</li>
     </ul>
 "@
             
             if ($Config.BackblazeB2.Enabled) {
                 $body += @"
-    <p>Backup was successfully uploaded to Backblaze B2.</p>
+    <p>Backup was successfully synchronized to Backblaze B2.</p>
 "@
             }
         }
         else {
+            if ($BackupInfo.ContainsKey("FailedDatabases") -and $BackupInfo.FailedDatabases.Count -gt 0) {
+                $body += @"
+    <h4>Failed Databases:</h4>
+    <ul>
+"@
+                foreach ($failedDb in $BackupInfo.FailedDatabases) {
+                    $body += @"
+        <li>$failedDb</li>
+"@
+                }
+                $body += @"
+    </ul>
+"@
+            }
+            
             $body += @"
     <h4>Error Details:</h4>
     <pre style="color: red; background-color: #f9f9f9; padding: 10px; border: 1px solid #ddd;">$ErrorMessage</pre>
@@ -555,12 +664,17 @@ try {
     
     # Sync to Backblaze B2
     Write-Log "Starting Backblaze B2 sync"
-    Sync-ToBackblaze -Config $config -CompressedFile $compressedFile
+    Sync-ToBackblaze -Config $config
     
     # Send success email notification
     $backupInfo = @{
         CompressedFile = $compressedFile
         DatabaseCount = $backupResult.BackupFiles.Count
+        DatabaseDetails = $backupResult.DatabaseDetails
+        TotalDatabases = $backupResult.TotalDatabases
+        SuccessCount = $backupResult.SuccessCount
+        FailureCount = $backupResult.FailureCount
+        FailedDatabases = $backupResult.FailedDatabases
     }
     Send-EmailNotification -Config $config -Success $true -BackupInfo $backupInfo
     
