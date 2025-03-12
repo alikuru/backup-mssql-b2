@@ -221,7 +221,7 @@ function Backup-Databases {
                 }
                 catch {
                     $errorMsg = $_
-                    Write-Log "Failed to backup database $dbName: $errorMsg" -Level "ERROR"
+                    Write-Log "Failed to backup database $dbName: $($errorMsg)" -Level "ERROR"
                     
                     $databaseDetails += @{
                         Name = $dbName
