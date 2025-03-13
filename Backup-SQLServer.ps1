@@ -373,7 +373,10 @@ function Compress-Backups {
         [PSCustomObject]$Config,
         
         [Parameter(Mandatory=$true)]
-        [string]$BackupFolder
+        [string]$BackupFolder,
+        
+        [Parameter(Mandatory=$true)]
+        [array]$DatabaseDetails
     )
     
     try {
@@ -383,36 +386,60 @@ function Compress-Backups {
             throw "7-Zip executable not found at path: $7zipPath"
         }
         
-        # Create compressed file
-        $timestamp = Split-Path -Path $BackupFolder -Leaf
-        $compressedFile = Join-Path -Path $Config.BackupPath -ChildPath "$timestamp.7z"
-        
-        Write-Log "Compressing backups to: $compressedFile"
-        
         # Set compression level
         $compressionLevel = $Config.Compression.Level
         if (-not $compressionLevel) {
             $compressionLevel = 5  # Default compression level
         }
         
-        # Compress the backup folder
-        $arguments = "a -t7z `"$compressedFile`" `"$BackupFolder\*`" -mx=$compressionLevel"
-        $process = Start-Process -FilePath $7zipPath -ArgumentList $arguments -NoNewWindow -PassThru -Wait
+        $timestamp = Split-Path -Path $BackupFolder -Leaf
+        $compressedFiles = @()
         
-        if ($process.ExitCode -ne 0) {
-            throw "7-Zip compression failed with exit code: $($process.ExitCode)"
+        # Compress each database backup individually
+        foreach ($db in $DatabaseDetails) {
+            if ($db.Status -eq "Success") {
+                $dbName = $db.Name
+                $backupFile = $db.FilePath
+                
+                # Create compressed file name with database name and timestamp
+                $compressedFileName = "$dbName-$timestamp.7z"
+                $compressedFile = Join-Path -Path $Config.BackupPath -ChildPath $compressedFileName
+                
+                Write-Log "Compressing backup for database $dbName to: $compressedFile"
+                
+                # Compress the backup file
+                $arguments = "a -t7z `"$compressedFile`" `"$backupFile`" -mx=$compressionLevel"
+                $process = Start-Process -FilePath $7zipPath -ArgumentList $arguments -NoNewWindow -PassThru -Wait
+                
+                if ($process.ExitCode -ne 0) {
+                    throw "7-Zip compression failed for database $dbName with exit code: $($process.ExitCode)"
+                }
+                
+                Write-Log "Compression completed successfully for database $dbName"
+                
+                # Update database details with compressed file information
+                $db.CompressedFile = $compressedFile
+                $db.CompressedSizeMB = [math]::Round((Get-Item $compressedFile).Length / 1MB, 2)
+                
+                $compressedFiles += $compressedFile
+            }
         }
         
-        Write-Log "Compression completed successfully"
-        
         # Remove the original backup folder to save space
-        Remove-Item -Path $BackupFolder -Recurse -Force
+        Remove-Item -Path $BackupFolder -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "Removed original backup folder after compression"
         
-        return $compressedFile
+        return $compressedFiles
     }
     catch {
         Write-Log "Compression failed: $_" -Level "ERROR"
+        
+        # Attempt to clean up the backup folder even if compression fails
+        if (Test-Path $BackupFolder) {
+            Remove-Item -Path $BackupFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Cleaned up backup folder after compression failure" -Level "WARNING"
+        }
+        
         throw $_
     }
 }
@@ -631,8 +658,10 @@ function Send-EmailNotification {
         <tr>
             <th>Database</th>
             <th>Status</th>
-            <th>Size</th>
+            <th>Size (Uncompressed)</th>
+            <th>Size (Compressed)</th>
             <th>Duration</th>
+            <th>Backup File</th>
         </tr>
 "@
             
@@ -640,14 +669,21 @@ function Send-EmailNotification {
                 $rowClass = if ($db.Status -eq "Success") { "success-row" } else { "failure-row" }
                 $statusClass = if ($db.Status -eq "Success") { "success" } else { "failure" }
                 $sizeInfo = if ($db.Status -eq "Success") { "$($db.SizeMB) MB" } else { "N/A" }
+                $compressedSizeInfo = if ($db.Status -eq "Success" -and $db.CompressedSizeMB) { "$($db.CompressedSizeMB) MB" } else { "N/A" }
                 $durationInfo = if ($db.Status -eq "Success") { "$([math]::Round($db.Duration.TotalSeconds, 2)) seconds" } else { "N/A" }
+                $backupFileInfo = if ($db.Status -eq "Success" -and $db.CompressedFile) { 
+                    $fileName = Split-Path -Path $db.CompressedFile -Leaf
+                    $fileName
+                } else { "N/A" }
                 
                 $body += @"
         <tr class="$rowClass">
             <td>$($db.Name)</td>
             <td class="$statusClass">$($db.Status)</td>
             <td>$sizeInfo</td>
+            <td>$compressedSizeInfo</td>
             <td>$durationInfo</td>
+            <td>$backupFileInfo</td>
         </tr>
 "@
             }
@@ -664,22 +700,13 @@ function Send-EmailNotification {
 "@
         }
         
-        if ($Success) {
+        if ($Success -and $Config.BackblazeB2.Enabled) {
             $body += @"
-    <h4>Backup File Details:</h4>
-    <ul>
-        <li>Backup Location: $($BackupInfo.CompressedFile)</li>
-        <li>Backup Size: $([math]::Round((Get-Item $BackupInfo.CompressedFile).Length / 1MB, 2)) MB</li>
-    </ul>
+    <p class="success">All backup files were successfully synchronized to Backblaze B2.</p>
 "@
-            
-            if ($Config.BackblazeB2.Enabled) {
-                $body += @"
-    <p>Backup was successfully synchronized to Backblaze B2.</p>
-"@
-            }
         }
-        else {
+        
+        if (-not $Success) {
             if ($BackupInfo.ContainsKey("FailedDatabases") -and $BackupInfo.FailedDatabases.Count -gt 0) {
                 $body += @"
     <h4>Failed Databases:</h4>
@@ -741,6 +768,52 @@ function Send-EmailNotification {
     }
 }
 
+function Cleanup-TempDirectories {
+    param (
+        [Parameter(Mandatory=$true)]
+        [PSCustomObject]$Config,
+        
+        [Parameter(Mandatory=$false)]
+        [string]$BackupFolder = $null
+    )
+    
+    try {
+        Write-Log "Starting cleanup of temporary directories"
+        
+        # Clean up specific backup folder if provided
+        if ($BackupFolder -and (Test-Path $BackupFolder)) {
+            Remove-Item -Path $BackupFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Removed specific backup folder: $BackupFolder"
+        }
+        
+        # Find and clean up any temporary backup folders that might have been left behind
+        # These would be folders with timestamp names (yyyyMMdd_HHmmss format)
+        if (Test-Path $Config.BackupPath) {
+            $tempFolders = Get-ChildItem -Path $Config.BackupPath -Directory | 
+                           Where-Object { $_.Name -match '^\d{8}_\d{6}$' }
+            
+            foreach ($folder in $tempFolders) {
+                # Check if folder is older than 1 day (to avoid removing currently running backups)
+                if ($folder.LastWriteTime -lt (Get-Date).AddDays(-1)) {
+                    Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed old temporary backup folder: $($folder.FullName)" -Level "WARNING"
+                }
+            }
+            
+            $removedCount = ($tempFolders | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) }).Count
+            if ($removedCount -gt 0) {
+                Write-Log "Removed $removedCount old temporary backup folders" -Level "WARNING"
+            }
+        }
+        
+        Write-Log "Temporary directory cleanup completed"
+    }
+    catch {
+        Write-Log "Error during temporary directory cleanup: $_" -Level "WARNING"
+        # Continue execution even if cleanup fails
+    }
+}
+
 #endregion
 
 #region Main Script Execution
@@ -764,7 +837,7 @@ try {
     
     # Compress backups
     Write-Log "Starting backup compression"
-    $compressedFile = Compress-Backups -Config $config -BackupFolder $backupResult.BackupFolder
+    $compressedFiles = Compress-Backups -Config $config -BackupFolder $backupResult.BackupFolder -DatabaseDetails $backupResult.DatabaseDetails
     
     # Remove old backups
     Write-Log "Starting backup rotation"
@@ -780,8 +853,7 @@ try {
     
     # Send success email notification
     $backupInfo = @{
-        CompressedFile = $compressedFile
-        DatabaseCount = $backupResult.BackupFiles.Count
+        CompressedFiles = $compressedFiles
         DatabaseDetails = $backupResult.DatabaseDetails
         TotalDatabases = $backupResult.TotalDatabases
         SuccessCount = $backupResult.SuccessCount
@@ -801,6 +873,15 @@ catch {
     Send-EmailNotification -Config $config -Success $false -ErrorMessage $errorMessage
     
     exit 1
+}
+finally {
+    # Always clean up temporary directories, even if errors occur
+    try {
+        Cleanup-TempDirectories -Config $config -BackupFolder $(if ($backupResult) { $backupResult.BackupFolder } else { $null })
+    }
+    catch {
+        Write-Log "Error during final cleanup: $_" -Level "ERROR"
+    }
 }
 
 #endregion
