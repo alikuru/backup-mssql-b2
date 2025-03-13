@@ -136,14 +136,17 @@ To set up a scheduled task to run the script daily:
 
 ## Logging
 
-The script creates a log file in the same directory as the script, named `Backup-SQLServer_YYYYMMDD_HHMMSS.log`. This log contains detailed information about the backup process.
+The script creates a log file in the `logs` directory under the script directory, named `Backup-SQLServer_YYYYMMDD_HHMMSS.log`. This log contains detailed information about the backup process.
 
 ## Troubleshooting
 
-- Check the log file for detailed error messages.
-- Ensure all prerequisites are installed and properly configured.
-- Verify SQL Server credentials and permissions.
-- Test email and B2 connectivity separately.
+This script is tested to work on the same machine where SQL Server is installed. If you are having connection issues, check if SQL Server Management Objects (SMO) is installed on the machine.
+
+Also, please note that the SQLPS module is an older, deprecated SQL Server PowerShell module that is no longer maintained, while the [SqlServer module is the current](https://learn.microsoft.com/en-us/powershell/sql-server/sql-server-powershell?view=sqlserver-ps#:~:text=There%20are%20two%20SQL%20Server,but%20is%20no%20longer%20updated.), actively maintained module for managing SQL Server instances via PowerShell. You may try installing the SqlServer PowerShell module if it's not already installed:
+
+```powershell
+Install-Module -Name SqlServer -Force -SkipPublisherCheck
+```
 
 ## License
 
