@@ -173,7 +173,7 @@ function Load-SqlServerAssemblies {
                         return $true
                     }
                     catch {
-                        Write-Log "Could not load SMO assembly from path $smoPath: $($_.Exception.Message)" -Level "WARNING"
+                        Write-Log "Could not load SMO assembly from path $($smoPath): $($_.Exception.Message)" -Level "WARNING"
                     }
                 }
             }
@@ -516,7 +516,7 @@ function Sync-ToBackblaze {
         }
         
         # Authorize account
-        $authorizeArgs = "authorize-account"
+        $authorizeArgs = "account authorize"
         $process = Start-Process -FilePath $b2CliPath -ArgumentList $authorizeArgs -NoNewWindow -PassThru -Wait
         
         if ($process.ExitCode -ne 0) {
@@ -532,7 +532,7 @@ function Sync-ToBackblaze {
         
         # Sync the backup directory to B2 with delete flag to remove files that don't exist locally
         Write-Log "Syncing backup directory to Backblaze B2: $sourcePath -> $destinationPath"
-        $syncArgs = "sync --delete --noProgress `"$sourcePath`" `"$destinationPath`""
+        $syncArgs = "sync --delete --no-progress `"$sourcePath`" `"$destinationPath`""
         $process = Start-Process -FilePath $b2CliPath -ArgumentList $syncArgs -NoNewWindow -PassThru -Wait
         
         if ($process.ExitCode -ne 0) {
