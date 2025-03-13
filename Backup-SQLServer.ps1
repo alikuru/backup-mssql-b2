@@ -452,28 +452,35 @@ function Remove-OldBackups {
     
     try {
         $retentionDays = $Config.RetentionDays
-        $backupPath = $Config.BackupPath
+        Write-Log "Removing backup files older than $retentionDays days"
         
-        Write-Log "Checking for backups older than $retentionDays days"
+        # Get current date
+        $currentDate = Get-Date
         
-        # Get all 7z files in the backup directory
-        $backupFiles = Get-ChildItem -Path $backupPath -Filter "*.7z" | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$retentionDays) }
+        # Get all backup files
+        $backupFiles = Get-ChildItem -Path $Config.BackupPath -Filter "*.7z" -File
         
-        if ($backupFiles.Count -gt 0) {
-            foreach ($file in $backupFiles) {
-                Remove-Item -Path $file.FullName -Force
-                Write-Log "Removed old backup: $($file.FullName)"
-            }
+        # Count of removed files
+        $removedCount = 0
+        
+        # Check each backup file
+        foreach ($file in $backupFiles) {
+            # Calculate file age in days
+            $fileAge = ($currentDate - $file.LastWriteTime).Days
             
-            Write-Log "Removed $($backupFiles.Count) old backup files"
+            # Remove files older than retention days
+            if ($fileAge -gt $retentionDays) {
+                Remove-Item -Path $file.FullName -Force
+                Write-Log "Removed old backup file: $($file.Name)"
+                $removedCount++
+            }
         }
-        else {
-            Write-Log "No old backups to remove"
-        }
+        
+        Write-Log "Removed $removedCount old backup files"
     }
     catch {
-        Write-Log "Failed to remove old backups: $_" -Level "WARNING"
-        # Continue execution even if cleanup fails
+        Write-Log "Error removing old backups: $_" -Level "ERROR"
+        throw $_
     }
 }
 
@@ -485,28 +492,45 @@ function Remove-OldLogs {
     
     try {
         $retentionDays = $Config.RetentionDays
-        $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+        Write-Log "Removing log files older than $retentionDays days"
         
-        Write-Log "Checking for log files older than $retentionDays days"
+        # Get current date
+        $currentDate = Get-Date
         
-        # Get all log files in the script directory
-        $logFiles = Get-ChildItem -Path $scriptPath -Filter "Backup-SQLServer_*.log" | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$retentionDays) }
+        # Get all log files in the logs directory
+        $logFiles = Get-ChildItem -Path $logsPath -Filter "*.log" -File
         
-        if ($logFiles.Count -gt 0) {
-            foreach ($file in $logFiles) {
-                Remove-Item -Path $file.FullName -Force
-                Write-Log "Removed old log file: $($file.FullName)"
+        # Count of removed files
+        $removedCount = 0
+        
+        # Check each log file
+        foreach ($file in $logFiles) {
+            # Skip the current log file
+            if ($file.FullName -eq $script:logFile) {
+                continue
             }
             
-            Write-Log "Removed $($logFiles.Count) old log files"
+            # Calculate file age in days
+            $fileAge = ($currentDate - $file.LastWriteTime).Days
+            
+            # Remove files older than retention days
+            if ($fileAge -gt $retentionDays) {
+                Remove-Item -Path $file.FullName -Force
+                Write-Log "Removed old log file: $($file.Name)"
+                $removedCount++
+            }
+        }
+        
+        if ($removedCount -gt 0) {
+            Write-Log "Removed $removedCount old log files"
         }
         else {
             Write-Log "No old log files to remove"
         }
     }
     catch {
-        Write-Log "Failed to remove old log files: $_" -Level "WARNING"
-        # Continue execution even if log cleanup fails
+        Write-Log "Failed to remove old logs: $_" -Level "WARNING"
+        # Continue execution even if cleanup fails
     }
 }
 
@@ -816,19 +840,153 @@ function Cleanup-TempDirectories {
 
 #endregion
 
+#region Logging Functions
+
+function Start-Log {
+    param (
+        [Parameter(Mandatory=$true)]
+        [PSCustomObject]$Config
+    )
+    
+    try {
+        # Create log filename with timestamp
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $logFileName = "SQLBackup_$timestamp.log"
+        $script:logFile = Join-Path -Path $logsPath -ChildPath $logFileName
+        
+        # Create log file
+        $script:logStream = [System.IO.StreamWriter]::new($script:logFile, $true)
+        
+        # Log script start
+        Write-Log "===== SQL Server Backup Script Started at $(Get-Date) ====="
+        Write-Log "Log file: $script:logFile"
+        
+        # Rotate old logs
+        Rotate-Logs -RetentionDays $Config.RetentionDays
+    }
+    catch {
+        Write-Host "Error initializing log file: $_" -ForegroundColor Red
+        throw $_
+    }
+}
+
+function Write-Log {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [string]$Level = "INFO"
+    )
+    
+    # Format timestamp
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    
+    # Format log message
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    # Write to console with color based on level
+    switch ($Level) {
+        "INFO" { Write-Host $logMessage -ForegroundColor Gray }
+        "WARNING" { Write-Host $logMessage -ForegroundColor Yellow }
+        "ERROR" { Write-Host $logMessage -ForegroundColor Red }
+    }
+    
+    # Write to log file if initialized
+    if ($script:logStream) {
+        $script:logStream.WriteLine($logMessage)
+        $script:logStream.Flush()
+    }
+}
+
+function Stop-Log {
+    if ($script:logStream) {
+        Write-Log "===== SQL Server Backup Script Completed at $(Get-Date) ====="
+        $script:logStream.Close()
+        $script:logStream.Dispose()
+        $script:logStream = $null
+    }
+}
+
+function Rotate-Logs {
+    param (
+        [Parameter(Mandatory=$true)]
+        [int]$RetentionDays
+    )
+    
+    try {
+        Write-Log "Rotating log files older than $RetentionDays days"
+        
+        # Get current date
+        $currentDate = Get-Date
+        
+        # Get all log files
+        $logFiles = Get-ChildItem -Path $logsPath -Filter "SQLBackup_*.log" -File
+        
+        # Count of removed files
+        $removedCount = 0
+        
+        # Check each log file
+        foreach ($file in $logFiles) {
+            # Skip the current log file
+            if ($file.FullName -eq $script:logFile) {
+                continue
+            }
+            
+            # Calculate file age in days
+            $fileAge = ($currentDate - $file.LastWriteTime).Days
+            
+            # Remove files older than retention days
+            if ($fileAge -gt $RetentionDays) {
+                Remove-Item -Path $file.FullName -Force
+                Write-Log "Removed old log file: $($file.FullName)"
+                $removedCount++
+            }
+        }
+        
+        if ($removedCount -gt 0) {
+            Write-Log "Removed $removedCount old log files"
+        }
+        else {
+            Write-Log "No old log files to remove"
+        }
+    }
+    catch {
+        Write-Log "Error rotating log files: $_" -Level "ERROR"
+        # Continue execution even if log rotation fails
+    }
+}
+
+#endregion
+
 #region Main Script Execution
 
 # Initialize script
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$script:LogFile = Join-Path -Path $scriptPath -ChildPath "Backup-SQLServer_$timestamp.log"
+$configPath = Join-Path -Path $scriptPath -ChildPath "config.json"
 
-Write-Log "SQL Server Backup Script started"
-Write-Log "Using configuration file: $ConfigPath"
+# Create logs directory if it doesn't exist
+$logsPath = Join-Path -Path $scriptPath -ChildPath "logs"
+if (-not (Test-Path -Path $logsPath)) {
+    New-Item -Path $logsPath -ItemType Directory -Force | Out-Null
+    Write-Host "Created logs directory: $logsPath"
+}
 
+# Global variables
+$script:logFile = $null
+$script:logStream = $null
+
+# Main execution
 try {
     # Read configuration
-    $config = Read-Config -ConfigPath $ConfigPath
+    $config = Get-Content -Path $configPath -Raw | ConvertFrom-Json
+    
+    # Start logging
+    Start-Log -Config $config
+    
+    Write-Log "SQL Server Backup Script started"
+    Write-Log "Using configuration file: $configPath"
     Write-Log "Configuration loaded successfully"
     
     # Backup databases
@@ -843,13 +1001,15 @@ try {
     Write-Log "Starting backup rotation"
     Remove-OldBackups -Config $config
     
-    # Remove old log files
+    # Remove old logs
     Write-Log "Starting log rotation"
     Remove-OldLogs -Config $config
     
-    # Sync to Backblaze B2
-    Write-Log "Starting Backblaze B2 sync"
-    Sync-ToBackblaze -Config $config
+    # Sync to Backblaze B2 if enabled
+    if ($config.BackblazeB2.Enabled) {
+        Write-Log "Starting Backblaze B2 sync"
+        Sync-ToBackblaze -Config $config
+    }
     
     # Send success email notification
     $backupInfo = @{
@@ -860,17 +1020,41 @@ try {
         FailureCount = $backupResult.FailureCount
         FailedDatabases = $backupResult.FailedDatabases
     }
-    Send-EmailNotification -Config $config -Success $true -BackupInfo $backupInfo
     
-    Write-Log "SQL Server Backup Script completed successfully"
+    if ($backupResult.FailureCount -eq 0) {
+        Write-Log "All database backups completed successfully"
+        Send-EmailNotification -Config $config -BackupInfo $backupInfo -Success $true
+    }
+    else {
+        Write-Log "$($backupResult.FailureCount) database backups failed" -Level "WARNING"
+        Send-EmailNotification -Config $config -BackupInfo $backupInfo -Success $false
+    }
+    
+    Write-Log "SQL Server backup script completed"
     exit 0
 }
 catch {
-    $errorMessage = $_.Exception.Message
-    Write-Log "SQL Server Backup Script failed: $errorMessage" -Level "ERROR"
+    # Try to log the error
+    if ($script:logStream) {
+        Write-Log "SQL Server backup script failed: $_" -Level "ERROR"
+    }
+    else {
+        # If logging hasn't been initialized yet, write to console
+        Write-Host "ERROR: SQL Server backup script failed: $_" -ForegroundColor Red
+    }
     
-    # Send failure email notification
-    Send-EmailNotification -Config $config -Success $false -ErrorMessage $errorMessage
+    # Try to send failure email notification
+    try {
+        Send-EmailNotification -Config $config -ErrorMessage $_.ToString() -Success $false
+    }
+    catch {
+        if ($script:logStream) {
+            Write-Log "Failed to send email notification: $_" -Level "ERROR"
+        }
+        else {
+            Write-Host "ERROR: Failed to send email notification: $_" -ForegroundColor Red
+        }
+    }
     
     exit 1
 }
@@ -880,8 +1064,16 @@ finally {
         Cleanup-TempDirectories -Config $config -BackupFolder $(if ($backupResult) { $backupResult.BackupFolder } else { $null })
     }
     catch {
-        Write-Log "Error during final cleanup: $_" -Level "ERROR"
+        if ($script:logStream) {
+            Write-Log "Error during final cleanup: $_" -Level "ERROR"
+        }
+        else {
+            Write-Host "ERROR: Error during final cleanup: $_" -ForegroundColor Red
+        }
     }
+    
+    # Stop log
+    Stop-Log
 }
 
 #endregion
