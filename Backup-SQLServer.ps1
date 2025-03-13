@@ -90,6 +90,125 @@ function Read-Config {
     }
 }
 
+function Load-SqlServerAssemblies {
+    Write-Log "Attempting to load SQL Server assemblies..."
+    
+    # Try multiple methods to load the assemblies
+    $loaded = $false
+    
+    # Method 1: Try to import the SqlServer module (preferred for newer environments)
+    try {
+        Import-Module SqlServer -ErrorAction Stop
+        Write-Log "Successfully loaded SqlServer module"
+        $loaded = $true
+        return $true
+    }
+    catch {
+        Write-Log "Could not load SqlServer module: $($_.Exception.Message)" -Level "WARNING"
+    }
+    
+    # Method 2: Try to import the SQLPS module (older environments)
+    if (-not $loaded) {
+        try {
+            Import-Module SQLPS -DisableNameChecking -ErrorAction Stop
+            Write-Log "Successfully loaded SQLPS module"
+            $loaded = $true
+            return $true
+        }
+        catch {
+            Write-Log "Could not load SQLPS module: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+    
+    # Method 3: Try to load the assemblies directly with specific versions
+    if (-not $loaded) {
+        try {
+            # SQL Server 2017/2019 assemblies
+            Add-Type -AssemblyName "Microsoft.SqlServer.Smo, Version=14.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91" -ErrorAction Stop
+            Add-Type -AssemblyName "Microsoft.SqlServer.SmoExtended, Version=14.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91" -ErrorAction Stop
+            Write-Log "Successfully loaded SQL Server 2017/2019 SMO assemblies"
+            $loaded = $true
+            return $true
+        }
+        catch {
+            Write-Log "Could not load SQL Server 2017/2019 SMO assemblies: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+    
+    # Method 4: Try to load the assemblies directly with other versions
+    if (-not $loaded) {
+        $versions = @("16.0.0.0", "15.0.0.0", "14.0.0.0", "13.0.0.0", "12.0.0.0", "11.0.0.0", "10.0.0.0")
+        foreach ($version in $versions) {
+            try {
+                Add-Type -AssemblyName "Microsoft.SqlServer.Smo, Version=$version, Culture=neutral, PublicKeyToken=89845dcd8080cc91" -ErrorAction Stop
+                Add-Type -AssemblyName "Microsoft.SqlServer.SmoExtended, Version=$version, Culture=neutral, PublicKeyToken=89845dcd8080cc91" -ErrorAction Stop
+                Write-Log "Successfully loaded SQL Server SMO assemblies version $version"
+                $loaded = $true
+                return $true
+            }
+            catch {
+                Write-Log "Could not load SQL Server SMO assemblies version $version" -Level "WARNING"
+            }
+        }
+    }
+    
+    # Method 5: Try to find and load the assemblies from common installation paths
+    if (-not $loaded) {
+        $sqlServerPaths = @(
+            "C:\Program Files\Microsoft SQL Server",
+            "C:\Program Files (x86)\Microsoft SQL Server"
+        )
+        
+        foreach ($basePath in $sqlServerPaths) {
+            if (Test-Path $basePath) {
+                $smoPath = Get-ChildItem -Path $basePath -Recurse -Filter "Microsoft.SqlServer.Smo.dll" -ErrorAction SilentlyContinue | 
+                           Where-Object { $_.FullName -match "SDK\\Assemblies" } | 
+                           Select-Object -First 1 -ExpandProperty FullName
+                
+                if ($smoPath) {
+                    try {
+                        Add-Type -Path $smoPath -ErrorAction Stop
+                        Write-Log "Successfully loaded SMO assembly from path: $smoPath"
+                        $loaded = $true
+                        return $true
+                    }
+                    catch {
+                        Write-Log "Could not load SMO assembly from path $smoPath: $($_.Exception.Message)" -Level "WARNING"
+                    }
+                }
+            }
+        }
+    }
+    
+    # Method 6: Last resort - try LoadWithPartialName
+    if (-not $loaded) {
+        try {
+            [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.Smo") | Out-Null
+            [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SmoExtended") | Out-Null
+            
+            # Verify the assemblies were loaded
+            $smoAssembly = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.FullName -like "*Microsoft.SqlServer.Smo*" }
+            
+            if ($smoAssembly) {
+                Write-Log "Successfully loaded SQL Server SMO assemblies using LoadWithPartialName"
+                $loaded = $true
+                return $true
+            }
+            else {
+                Write-Log "LoadWithPartialName did not successfully load the SMO assemblies" -Level "WARNING"
+            }
+        }
+        catch {
+            Write-Log "Could not load SQL Server SMO assemblies using LoadWithPartialName: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+    
+    if (-not $loaded) {
+        Write-Log "Failed to load SQL Server SMO assemblies using any method" -Level "ERROR"
+        return $false
+    }
+}
+
 function Backup-Databases {
     param (
         [Parameter(Mandatory=$true)]
@@ -97,6 +216,11 @@ function Backup-Databases {
     )
     
     try {
+        # Load SQL Server assemblies
+        if (-not (Load-SqlServerAssemblies)) {
+            throw "Failed to load SQL Server assemblies"
+        }
+        
         # Create backup directory if it doesn't exist
         if (-not (Test-Path $Config.BackupPath)) {
             New-Item -Path $Config.BackupPath -ItemType Directory -Force | Out-Null
@@ -108,18 +232,6 @@ function Backup-Databases {
         $backupFolder = Join-Path -Path $Config.BackupPath -ChildPath $timestamp
         New-Item -Path $backupFolder -ItemType Directory -Force | Out-Null
         Write-Log "Created backup folder for this run: $backupFolder"
-        
-        # Load SQL Server module if using it
-        if ($Config.UseSQLPSModule -eq $true) {
-            try {
-                Import-Module SQLPS -DisableNameChecking -ErrorAction Stop
-            }
-            catch {
-                Write-Log "Failed to import SQLPS module. Falling back to SMO." -Level "WARNING"
-                [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SMO") | Out-Null
-                [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SmoExtended") | Out-Null
-            }
-        }
         
         # Connect to SQL Server
         try {
@@ -220,13 +332,13 @@ function Backup-Databases {
                     $successCount++
                 }
                 catch {
-                    $errorMsg = $_
-                    Write-Log "Failed to backup database $dbName: $($errorMsg)" -Level "ERROR"
+                    $errorMsg = $_.Exception.Message
+                    Write-Log "Failed to backup database $($dbName): $($errorMsg)" -Level "ERROR"
                     
                     $databaseDetails += @{
                         Name = $dbName
                         Status = "Failed"
-                        Error = $errorMsg.ToString()
+                        Error = $errorMsg
                     }
                     
                     $failureCount++
