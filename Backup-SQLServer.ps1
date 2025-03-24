@@ -452,7 +452,7 @@ function Remove-OldBackups {
     
     try {
         $retentionDays = $Config.RetentionDays
-        Write-Log "Removing backup files older than $retentionDays days"
+        Write-Log "Removing backup files older than or equal to $retentionDays days"
         
         # Get current date
         $currentDate = Get-Date
@@ -468,8 +468,8 @@ function Remove-OldBackups {
             # Calculate file age in days
             $fileAge = ($currentDate - $file.LastWriteTime).Days
             
-            # Remove files older than retention days
-            if ($fileAge -gt $retentionDays) {
+            # Remove files older than or equal to retention days
+            if ($fileAge -ge $retentionDays) {
                 Remove-Item -Path $file.FullName -Force
                 Write-Log "Removed old backup file: $($file.Name)"
                 $removedCount++
@@ -492,7 +492,7 @@ function Remove-OldLogs {
     
     try {
         $retentionDays = $Config.RetentionDays
-        Write-Log "Removing log files older than $retentionDays days"
+        Write-Log "Removing log files older than or equal to $retentionDays days"
         
         # Get current date
         $currentDate = Get-Date
@@ -513,8 +513,8 @@ function Remove-OldLogs {
             # Calculate file age in days
             $fileAge = ($currentDate - $file.LastWriteTime).Days
             
-            # Remove files older than retention days
-            if ($fileAge -gt $retentionDays) {
+            # Remove files older than or equal to retention days
+            if ($fileAge -ge $retentionDays) {
                 Remove-Item -Path $file.FullName -Force
                 Write-Log "Removed old log file: $($file.Name)"
                 $removedCount++
@@ -916,7 +916,7 @@ function Rotate-Logs {
     )
     
     try {
-        Write-Log "Rotating log files older than $RetentionDays days"
+        Write-Log "Rotating log files older than or equal to $RetentionDays days"
         
         # Get current date
         $currentDate = Get-Date
@@ -937,10 +937,10 @@ function Rotate-Logs {
             # Calculate file age in days
             $fileAge = ($currentDate - $file.LastWriteTime).Days
             
-            # Remove files older than retention days
-            if ($fileAge -gt $RetentionDays) {
+            # Remove files older than or equal to retention days
+            if ($fileAge -ge $RetentionDays) {
                 Remove-Item -Path $file.FullName -Force
-                Write-Log "Removed old log file: $($file.FullName)"
+                Write-Log "Removed old log file: $($file.Name)"
                 $removedCount++
             }
         }
