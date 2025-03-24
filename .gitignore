@@ -7,3 +7,4 @@
 Backup-SQLServer_*.log
 config.json
 ScheduledTask.xml
+logs
